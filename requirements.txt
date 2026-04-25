@@ -1,0 +1,18 @@
+# Full dependency set — adds optional offline Whisper STT and PyAudio
+# capture on top of the cross-version core. Uses environment markers so
+# Python 3.14 installs gracefully without PyAudio/Whisper wheels.
+#
+#   pip install -r requirements.txt
+#
+# If something fails on 3.14, fall back to the headless set (which still
+# supports voice via sounddevice + Google STT):
+#   pip install -r requirements-core.txt
+
+-r requirements-core.txt
+
+# ---- Optional: PyAudio capture (preferred when wheels exist) ----
+pyaudio>=0.2.14            ; python_version < "3.13"
+
+# ---- Optional: offline Whisper transcription ----
+openai-whisper>=20240930   ; python_version < "3.13"
+torch>=2.2                 ; python_version < "3.13"
