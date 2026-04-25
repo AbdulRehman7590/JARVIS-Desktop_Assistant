@@ -221,5 +221,4 @@ the exe.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE). Do whatever you want, but don't blame me if you tell
-JARVIS to format `D:\`.
+MIT — see [`LICENSE`](LICENSE).
