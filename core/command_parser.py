@@ -140,6 +140,187 @@ def _make_regex_rule(
 
 
 # ---------------------------------------------------------------------------
+# History-recall helpers — used by the `recall_history` rule below.
+# ---------------------------------------------------------------------------
+# Map a verb the user might use ("deleted", "made", "ran", ...) back to
+# the executor intent kind it would have produced. ``None`` means "don't
+# filter by kind, search by keyword only" — useful when the verb maps
+# to two different intents (create_file vs create_folder).
+_RECALL_VERB_TO_KIND: Dict[str, Optional[str]] = {
+    "delete": "delete", "deleted": "delete",
+    "remove": "delete", "removed": "delete",
+    "erase": "delete", "erased": "delete",
+    "trash": "delete", "trashed": "delete",
+    "destroy": "delete", "destroyed": "delete",
+    # "create" / "make" / "open" intentionally map to ``None`` — they
+    # can mean either of two intents (file vs folder, folder vs app)
+    # so we let the keyword search do the disambiguation instead of
+    # locking the recall to one wrong kind.
+    "create": None, "created": None,
+    "make": None, "made": None,
+    "write": "create_file", "wrote": "create_file", "written": "create_file",
+    "rename": "rename", "renamed": "rename",
+    "move": "move", "moved": "move",
+    "copy": "copy", "copied": "copy",
+    "open": None, "opened": None,
+    "search": "search_file", "searched": "search_file",
+    "find": "search_file", "found": "search_file", "look": "search_file",
+    "launch": "launch_app", "launched": "launch_app",
+    "start": "launch_app", "started": "launch_app",
+    "run": "launch_app", "ran": "launch_app",
+    "took": "screenshot", "take": "screenshot",
+}
+
+
+def _recall_window_days(text: str) -> Optional[int]:
+    """Map natural-language time windows to a day count.
+
+    Returns ``None`` when no explicit window is mentioned so the caller
+    can default to the full 30-day retention. We never return more than
+    30 because that's the on-disk retention limit.
+    """
+    t = text.lower()
+    if re.search(r"\btoday\b", t):
+        return 1
+    if re.search(r"\byesterday\b", t):
+        return 2
+    if re.search(r"\b(?:this|the\s+past|the\s+last|past|last)\s+week\b", t):
+        return 7
+    if re.search(r"\b(?:this|the\s+past|the\s+last|past|last)\s+month\b", t):
+        return 30
+    if re.search(r"\b(?:past|last)\s+30\s+days?\b", t):
+        return 30
+    m = re.search(r"\b(?:in\s+the\s+)?(?:past|last)\s+(\d{1,3})\s+days?\b", t)
+    if m:
+        return min(30, max(1, int(m.group(1))))
+    if re.search(r"\brecent(?:ly)?\b", t):
+        return 7
+    return None
+
+
+_RECALL_TRIGGERS_RE = re.compile(
+    r"\b(?:"
+    r"did\s+i\b"
+    r"|have\s+i\b"
+    r"|do\s+i\s+have\b"
+    r"|what\s+(?:did|have|do|else\s+did)\s+i\s+(?:do|done|delete|create|"
+    r"make|run|launch|open)\b"
+    r"|when\s+did\s+i\s+(?:last\s+)?\w+"
+    r"|show\s+(?:me\s+)?(?:my\s+)?(?:command\s+)?(?:history|activity|log|chats?|past\s+commands?)\b"
+    r"|view\s+(?:my\s+)?(?:command\s+)?(?:history|activity|log|chats?)\b"
+    r"|(?:my|the)\s+(?:command\s+)?(?:history|activity|chat\s+log|log)\b"
+    r"|any\s+(?:deletes?|removes?|creates?|opens?|renames?|moves?|copies?|"
+    r"searches?|launches?|screenshots?)\b"
+    r"|recall\b"
+    r"|remember\s+(?:if\s+i|when\s+i|what\s+i)\b"
+    r"|(?:list|show)\s+(?:everything|all\s+commands?)\s+(?:from|for)\s+"
+    r"(?:today|yesterday|the\s+(?:past|last)\s+\w+)"
+    r")",
+    re.IGNORECASE,
+)
+
+# After the trigger we try to extract the verb the user used so we can
+# narrow the search to a specific intent kind. We accept the verb in any
+# tense (delete / deleted) and a wide list because voice transcripts are
+# noisy.
+_RECALL_VERB_RE = re.compile(
+    r"\b(?:i\s+)?("
+    + "|".join(
+        sorted({re.escape(v) for v in _RECALL_VERB_TO_KIND}, key=len, reverse=True)
+    )
+    + r")\b",
+    re.IGNORECASE,
+)
+
+# Try to pull a keyword (file name, app name, ...) out of phrases like
+# "delete resume.pdf", "for resume", "named foo.txt", "called Demo".
+_RECALL_KEYWORD_RE = re.compile(
+    r"\b(?:for|named|called|like|file|folder|app|application)\s+"
+    r"['\"]?([\w\-. ]+?)['\"]?"
+    r"(?=\s+(?:today|yesterday|recently|this|last|past|in)\b|[?.!]|$)",
+    re.IGNORECASE,
+)
+
+
+_RECALL_FILLER_WORDS: set = {
+    "anything", "something", "any", "the", "a", "an", "my",
+    "today", "yesterday", "recently", "files", "folders",
+    "file", "folder", "stuff",
+}
+
+# Time tokens we trim off the tail when extracting an inline keyword
+# ("delete resume.pdf yesterday" -> keyword="resume.pdf").
+_RECALL_TAIL_TIME_RE = re.compile(
+    r"\s*(?:today|yesterday|recently|this\s+\w+|last\s+\w+|"
+    r"past\s+\w+|in\s+the\s+(?:past|last)\s+\w+|\bago\b).*$",
+    re.IGNORECASE,
+)
+# Articles to strip from the head of an extracted keyword.
+_RECALL_HEAD_ARTICLE_RE = re.compile(
+    r"^\s*(?:that|the|a|an|my|some|any|those|these)\s+",
+    re.IGNORECASE,
+)
+
+
+def _clean_recall_keyword(raw: str) -> Optional[str]:
+    """Tidy up a candidate keyword pulled out of the user's sentence."""
+    if not raw:
+        return None
+    cleaned = _RECALL_TAIL_TIME_RE.sub("", raw)
+    cleaned = _RECALL_HEAD_ARTICLE_RE.sub("", cleaned)
+    cleaned = cleaned.strip(" '\"?.!,;:")
+    if not cleaned or cleaned.lower() in _RECALL_FILLER_WORDS:
+        return None
+    if len(cleaned) > 60:
+        return None
+    return cleaned
+
+
+def _recall_history_matcher(text: str) -> Optional[Intent]:
+    """Detect questions about past commands and build a structured query."""
+    if not _RECALL_TRIGGERS_RE.search(text):
+        return None
+
+    args: Dict[str, Any] = {}
+    days = _recall_window_days(text)
+    if days is not None:
+        args["days"] = days
+
+    verb_m = _RECALL_VERB_RE.search(text)
+    if verb_m:
+        verb = verb_m.group(1).lower()
+        kind = _RECALL_VERB_TO_KIND.get(verb)
+        if kind:
+            args["intent_kind"] = kind
+
+    # Try the labelled-leader pattern first ("for X", "named X", ...).
+    kw_m = _RECALL_KEYWORD_RE.search(text)
+    if kw_m:
+        cleaned = _clean_recall_keyword(kw_m.group(1))
+        if cleaned:
+            args["keyword"] = cleaned
+
+    # Fallback: a bare noun phrase right after the verb. This catches
+    # "did i delete report.docx" / "have i opened chrome this week".
+    if "keyword" not in args and verb_m:
+        tail = text[verb_m.end():].lstrip()
+        # Don't grab the whole rest of the sentence — just the first
+        # noun-ish token (a path, file name, or single identifier).
+        token_m = re.match(
+            r"['\"]?([\w\-./\\: ]+?)['\"]?(?=\s|[?.!,;:]|$)",
+            tail,
+        )
+        if token_m:
+            cleaned = _clean_recall_keyword(token_m.group(1))
+            if cleaned:
+                args["keyword"] = cleaned
+
+    intent = Intent("recall_history", args)
+    intent.raw = text
+    return intent
+
+
+# ---------------------------------------------------------------------------
 # Builders for individual rules — kept tiny on purpose.
 # ---------------------------------------------------------------------------
 def _build_rules() -> List[IntentRule]:
@@ -259,6 +440,105 @@ def _build_rules() -> List[IntentRule]:
         "log_off",
         r"\b(log\s*off|sign\s*out)\b",
         lambda m, t: Intent("log_off"),
+    ))
+
+    # ----- recall_history -----------------------------------------------
+    # Catches questions about past activity inside the 30-day retention
+    # window: "did I delete that file yesterday?", "what did I do
+    # today?", "show me my activity this week", "any deletes recently?"
+    # The executor cross-references the kept history and replies in
+    # natural language. Keeping this BEFORE the create/delete rules
+    # is essential — otherwise "did i delete X" would be parsed as a
+    # delete request and we'd actually try to remove something.
+    rules.append(IntentRule(
+        name="recall_history",
+        matcher=_recall_history_matcher,
+    ))
+
+    # ----- vague-command clarifiers -------------------------------------
+    # When the user says something like "create file" or "delete a file"
+    # without naming the target, we fire a `clarify` intent so the
+    # executor can bounce back a short follow-up question (e.g. "What
+    # name should the file have, and where?"). Order matters — these
+    # MUST come before the strict create/delete/rename rules below or
+    # the strict rules' optional captures could swallow the bare verb.
+    def _vague_for(intent_name: str, pattern: str) -> IntentRule:
+        compiled = re.compile(pattern, re.IGNORECASE)
+
+        def _matcher(text: str) -> Optional[Intent]:
+            if not compiled.match(text):
+                return None
+            intent = Intent("clarify", {"for": intent_name})
+            intent.raw = text
+            return intent
+
+        return IntentRule(name=f"clarify_{intent_name}", matcher=_matcher)
+
+    # Tolerated politeness fillers at the head / tail of the command
+    # so "please delete file" and "delete the file please" both match.
+    _LEAD = (
+        r"(?:please\s+|can\s+you\s+|could\s+you\s+|kindly\s+|"
+        r"hey\s+|just\s+)?"
+    )
+    _TAIL = r"(?:\s+(?:please|now|for\s+me|right\s+now))?\s*[.?!]?\s*$"
+
+    rules.append(_vague_for(
+        "create_file",
+        r"^" + _LEAD
+        + r"(?:create|make|write|new|add)\s+(?:a\s+|an\s+|me\s+a\s+)?"
+        + r"(?:new\s+|empty\s+|blank\s+)?file" + _TAIL,
+    ))
+    rules.append(_vague_for(
+        "create_folder",
+        r"^" + _LEAD
+        + r"(?:create|make|new|add)\s+(?:a\s+|an\s+|me\s+a\s+)?"
+        + r"(?:new\s+|empty\s+)?(?:folder|directory)" + _TAIL,
+    ))
+    rules.append(_vague_for(
+        "delete",
+        r"^" + _LEAD
+        + r"(?:delete|remove|erase|trash|destroy)"
+        + r"(?:\s+(?:the|a|an|some))?"
+        + r"(?:\s+(?:file|folder|directory|files|folders))?"
+        + _TAIL,
+    ))
+    rules.append(_vague_for(
+        "rename",
+        r"^" + _LEAD + r"rename"
+        + r"(?:\s+(?:the|a|an))?"
+        + r"(?:\s+(?:file|folder|directory))?" + _TAIL,
+    ))
+    rules.append(_vague_for(
+        "copy",
+        r"^" + _LEAD + r"copy"
+        + r"(?:\s+(?:the|a|an))?"
+        + r"(?:\s+(?:file|folder))?" + _TAIL,
+    ))
+    rules.append(_vague_for(
+        "move",
+        r"^" + _LEAD + r"move"
+        + r"(?:\s+(?:the|a|an))?"
+        + r"(?:\s+(?:file|folder))?" + _TAIL,
+    ))
+    rules.append(_vague_for(
+        "search_file",
+        r"^" + _LEAD
+        + r"(?:search|find|look\s+for|locate)"
+        + r"(?:\s+(?:a|the))?"
+        + r"(?:\s+(?:file|folder|files))?" + _TAIL,
+    ))
+    rules.append(_vague_for(
+        "open_folder",
+        r"^" + _LEAD + r"open"
+        + r"(?:\s+(?:the|a))?"
+        + r"(?:\s+(?:folder|directory))?" + _TAIL,
+    ))
+    rules.append(_vague_for(
+        "launch_app",
+        r"^" + _LEAD
+        + r"(?:launch|start|run|open)"
+        + r"(?:\s+(?:the|a|an))?"
+        + r"(?:\s+app(?:lication)?)?" + _TAIL,
     ))
 
     # ----- file ops: write group ----------------------------------------

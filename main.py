@@ -220,14 +220,17 @@ def run_voice_only_mode(app: JarvisApp, wake_word: bool = False) -> None:
         return "no"
 
     def _voice_confirm(question: str) -> bool:
+        from speech.speech_to_text import classify_yes_no  # noqa: PLC0415
+
         app.speak(question)
-        for _ in range(2):
-            heard = (listener.listen_once(timeout=8.0) or "").lower().strip()
-            if heard.startswith(("yes", "yeah", "yep", "ok", "okay", "sure", "do it")):
+        for _ in range(3):
+            heard = listener.listen_once(timeout=8.0) or ""
+            verdict = classify_yes_no(heard)
+            if verdict is True:
                 return True
-            if heard.startswith(("no", "nope", "cancel", "stop", "abort")):
+            if verdict is False:
                 return False
-            app.speak("Please say yes or no.")
+            app.speak("Sorry, please say yes or no.")
         return False
 
     # Re-wire JarvisApp's prompters now that the listener exists.

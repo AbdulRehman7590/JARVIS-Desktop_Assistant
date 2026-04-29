@@ -41,7 +41,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 from PySide6.QtCore import (
     QEasingCurve,
@@ -67,6 +67,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QGraphicsOpacityEffect,
@@ -88,11 +90,19 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon,
     QTextEdit,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from core.history import HistoryEntry, format_local
+from core.history import (
+    History,
+    HistoryEntry,
+    RETENTION_DAYS,
+    entry_local_dt,
+    format_local,
+)
 from core.permissions import PermissionCategory
 from gui.qt_settings import SettingsDialog
 from gui.qt_theme import (
@@ -248,6 +258,343 @@ class FloatingOverlay(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Voice + button confirmation dialog
+# ---------------------------------------------------------------------------
+class VoiceConfirmDialog(QDialog):
+    """Confirmation popup that accepts BOTH a button click and a voice reply.
+
+    Why a custom dialog (instead of ``QMessageBox.question``):
+        ``QMessageBox`` blocks the UI thread inside a native event loop
+        we can't reach from the mic worker, so spoken "yes / no"
+        couldn't dismiss it. This dialog exposes :meth:`accept` /
+        :meth:`reject` slots that the dashboard's listen loop can fire
+        from a background thread (via ``QTimer.singleShot(0, ...)``)
+        the moment the classifier returns a verdict, while the buttons
+        keep working exactly as the user expects.
+
+    A small "voice indicator" footer shows the most recent transcript
+    so the user can see whether JARVIS heard them correctly.
+    """
+
+    def __init__(self, question: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Confirm")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        heading = QLabel("\U0001F914  Just to confirm")
+        heading.setStyleSheet(
+            f"color:{Palette.ACCENT}; font-weight:800; font-size:13pt;"
+        )
+        layout.addWidget(heading)
+
+        self._question_label = QLabel(question)
+        self._question_label.setWordWrap(True)
+        self._question_label.setStyleSheet(
+            f"color:{Palette.FG}; font-size:11pt;"
+        )
+        layout.addWidget(self._question_label)
+
+        hint = QLabel(
+            "Click a button below \u2014 or just say "
+            "\u201cyes\u201d / \u201cno\u201d aloud."
+        )
+        hint.setStyleSheet(
+            f"color:{Palette.FG_DIM}; font-size:10pt; font-style:italic;"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self._voice_label = QLabel("\U0001F3A4  Listening for your reply\u2026")
+        self._voice_label.setStyleSheet(
+            f"color:{Palette.ACCENT}; font-size:10pt; "
+            "padding:8px 10px; "
+            f"background:{Palette.PANEL_HI}; border-radius:8px;"
+        )
+        self._voice_label.setWordWrap(True)
+        layout.addWidget(self._voice_label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+
+        self._no_btn = QPushButton("No, cancel")
+        self._no_btn.setObjectName("Danger")
+        self._no_btn.setMinimumHeight(38)
+        self._no_btn.clicked.connect(self.reject)
+        button_row.addWidget(self._no_btn)
+
+        self._yes_btn = QPushButton("Yes, do it")
+        self._yes_btn.setObjectName("Accent")
+        self._yes_btn.setMinimumHeight(38)
+        self._yes_btn.clicked.connect(self.accept)
+        button_row.addWidget(self._yes_btn)
+
+        layout.addLayout(button_row)
+
+        # Default to the safer "No" button on Enter so a stray keystroke
+        # never confirms a destructive op accidentally.
+        self._no_btn.setDefault(True)
+        self._no_btn.setAutoDefault(True)
+
+    def show_voice_feedback(
+        self, transcript: str, verdict: Optional[bool]
+    ) -> None:
+        """Update the live indicator with what we just heard."""
+        if verdict is True:
+            icon = "\u2705"
+            colour = Palette.SUCCESS
+            msg = f"Heard \u201c{transcript}\u201d \u2014 confirming."
+        elif verdict is False:
+            icon = "\u26D4"
+            colour = Palette.ERROR
+            msg = f"Heard \u201c{transcript}\u201d \u2014 cancelling."
+        else:
+            icon = "\U0001F3A4"
+            colour = Palette.WARNING
+            msg = (
+                f"Heard \u201c{transcript}\u201d \u2014 "
+                "I need a clearer yes or no."
+            )
+        self._voice_label.setText(f"{icon}  {msg}")
+        self._voice_label.setStyleSheet(
+            f"color:{colour}; font-size:10pt; padding:8px 10px; "
+            f"background:{Palette.PANEL_HI}; border-radius:8px;"
+        )
+
+
+# ---------------------------------------------------------------------------
+# History viewer — day-by-day timeline of the last 30 days
+# ---------------------------------------------------------------------------
+class HistoryDialog(QDialog):
+    """Modal viewer that groups every kept chat by the day it happened on.
+
+    The :class:`History` store enforces a hard 30-day retention, so this
+    dialog never shows anything older. It's organised as a tree:
+
+    * Top-level rows are local dates ("Today \u2013 Apr 29, 2026 (12)").
+    * Children are the individual commands for that day, in
+      chronological order, with the time, intent kind, and a snippet
+      of the user's request and JARVIS's reply.
+
+    A live filter at the top narrows by free-text (matches against the
+    user's text, the response, or the intent kind) and a kind dropdown
+    isolates a single command type. A details pane on the right shows
+    the full text of whatever entry is selected, which is useful for
+    long replies that get truncated in the tree.
+    """
+
+    def __init__(self, history: History, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(
+            f"JARVIS \u00B7 Chat history (last {RETENTION_DAYS} days)"
+        )
+        self.setMinimumSize(760, 540)
+        self._history = history
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 14, 16, 14)
+        outer.setSpacing(10)
+
+        # ---- Header ----
+        head = QLabel(
+            f"\U0001F5C2  Showing your activity from the last "
+            f"{RETENTION_DAYS} days. Older entries are automatically "
+            f"forgotten."
+        )
+        head.setStyleSheet(
+            f"color:{Palette.FG_DIM}; font-size:10pt; font-style:italic;"
+        )
+        head.setWordWrap(True)
+        outer.addWidget(head)
+
+        # ---- Filter row ----
+        filter_row = QHBoxLayout()
+        self._filter = QLineEdit()
+        self._filter.setPlaceholderText(
+            "Search by text, intent, or reply\u2026"
+        )
+        self._filter.textChanged.connect(self._reload)
+        filter_row.addWidget(self._filter, 2)
+
+        self._kind_combo = QComboBox()
+        self._kind_combo.addItem("All actions", "")
+        self._kind_combo.currentIndexChanged.connect(self._reload)
+        filter_row.addWidget(self._kind_combo, 1)
+
+        outer.addLayout(filter_row)
+
+        # ---- Body: tree on the left, details on the right ----
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(6)
+
+        self._tree = QTreeWidget()
+        self._tree.setHeaderLabels(["When", "Action", "Detail"])
+        self._tree.setRootIsDecorated(True)
+        self._tree.setAlternatingRowColors(False)
+        self._tree.setColumnWidth(0, 130)
+        self._tree.setColumnWidth(1, 130)
+        self._tree.itemSelectionChanged.connect(self._on_select)
+        splitter.addWidget(self._tree)
+
+        details_panel = QFrame()
+        details_panel.setObjectName("Card")
+        d_layout = QVBoxLayout(details_panel)
+        d_layout.setContentsMargins(12, 10, 12, 10)
+        d_layout.setSpacing(6)
+        details_head = QLabel("DETAILS")
+        details_head.setObjectName("Subtle")
+        d_layout.addWidget(details_head)
+        self._details = QTextEdit()
+        self._details.setReadOnly(True)
+        self._details.setPlaceholderText(
+            "Select an entry on the left to see the full text."
+        )
+        d_layout.addWidget(self._details, 1)
+        splitter.addWidget(details_panel)
+
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([460, 280])
+        outer.addWidget(splitter, 1)
+
+        # ---- Footer ----
+        footer_row = QHBoxLayout()
+        self._summary = QLabel("")
+        self._summary.setStyleSheet(f"color:{Palette.FG_DIM}; font-size:10pt;")
+        footer_row.addWidget(self._summary, 1)
+
+        purge_btn = QPushButton("Purge old now")
+        purge_btn.setToolTip(
+            "Force-remove anything past the 30-day window right now."
+        )
+        purge_btn.clicked.connect(self._on_purge)
+        footer_row.addWidget(purge_btn)
+
+        close_btn = QPushButton("Close")
+        close_btn.setObjectName("Accent")
+        close_btn.clicked.connect(self.accept)
+        footer_row.addWidget(close_btn)
+        outer.addLayout(footer_row)
+
+        self._populate_kind_combo()
+        self._reload()
+
+    # ------------------------------------------------------------------
+    def _populate_kind_combo(self) -> None:
+        kinds = sorted({e.intent_kind for e in self._history.all()
+                        if e.intent_kind})
+        for k in kinds:
+            self._kind_combo.addItem(k, k)
+
+    def _reload(self) -> None:
+        self._tree.clear()
+        keyword = self._filter.text().strip() or None
+        kind = self._kind_combo.currentData() or None
+
+        groups = self._history.by_day(days=RETENTION_DAYS)
+        total_entries = 0
+        kept_days = 0
+
+        from datetime import date as _date  # noqa: PLC0415
+        today = _date.today()
+
+        for day, entries in groups.items():
+            # Apply filters per-day so empty days drop out cleanly.
+            shown = [
+                e for e in entries
+                if (kind is None or e.intent_kind == kind)
+                and (keyword is None
+                     or keyword.lower() in e.user_text.lower()
+                     or keyword.lower() in e.response.lower()
+                     or keyword.lower() in e.intent_kind.lower())
+            ]
+            if not shown:
+                continue
+            kept_days += 1
+            total_entries += len(shown)
+
+            day_label = self._format_day_header(day, today, len(shown))
+            day_node = QTreeWidgetItem([day_label, "", ""])
+            day_font = day_node.font(0)
+            day_font.setBold(True)
+            day_node.setFont(0, day_font)
+            day_node.setForeground(0, QColor(Palette.ACCENT))
+            day_node.setFirstColumnSpanned(True)
+            self._tree.addTopLevelItem(day_node)
+
+            for entry in shown:
+                local = entry_local_dt(entry)
+                when = local.strftime("%I:%M %p").lstrip("0") if local else "?"
+                snippet = entry.user_text or entry.response
+                if len(snippet) > 80:
+                    snippet = snippet[:77].rstrip() + "..."
+                child = QTreeWidgetItem([when, entry.intent_kind, snippet])
+                child.setForeground(
+                    1,
+                    QColor(Palette.SUCCESS if entry.success else Palette.ERROR),
+                )
+                child.setData(0, Qt.ItemDataRole.UserRole, entry)
+                day_node.addChild(child)
+
+            day_node.setExpanded(True)
+
+        self._summary.setText(
+            f"{total_entries} command{'s' if total_entries != 1 else ''} "
+            f"across {kept_days} day{'s' if kept_days != 1 else ''} "
+            f"(retention: {RETENTION_DAYS} days)."
+        )
+        if total_entries == 0:
+            self._details.setPlainText(
+                "No entries match the current filters."
+            )
+
+    @staticmethod
+    def _format_day_header(day, today, count: int) -> str:
+        delta = (today - day).days
+        if delta == 0:
+            label = "Today"
+        elif delta == 1:
+            label = "Yesterday"
+        elif delta < 7:
+            label = day.strftime("%A")  # Monday, Tuesday, ...
+        else:
+            label = day.strftime("%b %d")
+        return (
+            f"{label} \u2014 {day.strftime('%Y-%m-%d')} "
+            f"({count} command{'s' if count != 1 else ''})"
+        )
+
+    def _on_select(self) -> None:
+        items = self._tree.selectedItems()
+        if not items:
+            return
+        entry = items[0].data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, HistoryEntry):
+            self._details.clear()
+            return
+        when = format_local(entry.timestamp)
+        status = "succeeded" if entry.success else "FAILED"
+        self._details.setPlainText(
+            f"{when}  \u00B7  {entry.intent_kind}  \u00B7  {status}\n\n"
+            f"YOU: {entry.user_text or '(empty)'}\n\n"
+            f"JARVIS: {entry.response or '(no reply)'}"
+        )
+
+    def _on_purge(self) -> None:
+        removed = self._history.purge_old()
+        self._populate_kind_combo()
+        self._reload()
+        self._summary.setText(
+            self._summary.text() + f"  \u2022  Purged {removed} old "
+            f"entr{'ies' if removed != 1 else 'y'}."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class Dashboard(QMainWindow):
@@ -276,6 +623,11 @@ class Dashboard(QMainWindow):
         self._is_background = False
         self._closing = False
         self._last_reply_text = "Ready when you are."
+
+        # While a confirmation dialog is showing this points at a
+        # callable that consumes the next mic utterance instead of
+        # treating it as a new command. ``None`` ⇒ normal command flow.
+        self._voice_capture_target: Optional[Callable[[str], None]] = None
 
         self.bridge = _Bridge()
         self._wire_bridge()
@@ -456,12 +808,25 @@ class Dashboard(QMainWindow):
             self._on_history_select)
         v.addWidget(self.history_list, 1)
 
+        view_btn = QPushButton("\U0001F5C2  View by day\u2026")
+        view_btn.setToolTip(
+            f"Open the day-by-day history viewer "
+            f"(last {RETENTION_DAYS} days)."
+        )
+        view_btn.clicked.connect(self._open_history_dialog)
+        v.addWidget(view_btn)
+
         clear_btn = QPushButton("Clear history")
         clear_btn.clicked.connect(self._clear_history)
         v.addWidget(clear_btn)
 
         self._sidebar_widget = side
         return side
+
+    def _open_history_dialog(self) -> None:
+        """Show the day-wise history viewer dialog."""
+        dlg = HistoryDialog(self.app.history, parent=self)
+        dlg.exec()
 
     # ------------------------------------------------------------------
     def _build_conversation(self) -> QWidget:
@@ -796,6 +1161,35 @@ class Dashboard(QMainWindow):
             speaker = self.app.speaker
             speaking = bool(getattr(speaker, "is_speaking", False))
 
+            # ----- VOICE-CONFIRM ROUTING (highest priority) ---------
+            # When a confirmation dialog is up we hijack the listener
+            # entirely: every captured utterance is forwarded to the
+            # dialog's handler instead of going through the normal
+            # wake-word / command pipeline. We deliberately wait until
+            # JARVIS finishes speaking so the mic doesn't pick up our
+            # own TTS output as the user's reply.
+            target = self._voice_capture_target
+            if target is not None:
+                if speaking:
+                    time.sleep(0.1)
+                    continue
+                self.bridge.status_changed.emit(
+                    "listening", "Listening for yes / no\u2026"
+                )
+                try:
+                    text = self._listener.listen_once(
+                        timeout=2.0, phrase_time_limit=3.0,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _log.debug("Confirm capture error: %s", exc)
+                    text = None
+                if text:
+                    try:
+                        target(text)
+                    except Exception as exc:  # noqa: BLE001
+                        _log.debug("Confirm route error: %s", exc)
+                continue
+
             # ----- BARGE-IN MONITOR ----------------------------------
             # Highest priority: while JARVIS is talking, capture short
             # 1.6 s windows and check for the wake word. The instant we
@@ -1084,12 +1478,47 @@ class Dashboard(QMainWindow):
             response_q.put("no")
 
     def _open_confirm_dialog(self, question: str, response_q) -> None:
-        reply = QMessageBox.question(
-            self, "Confirm", question,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        """Show a confirm popup that accepts both clicks AND spoken yes/no.
+
+        The dashboard's mic loop is temporarily routed into the dialog
+        for the duration of ``exec()``: while the popup is visible
+        every utterance is classified by :func:`classify_yes_no` and,
+        when conclusive, drives the dialog's accept/reject — the same
+        actions the buttons trigger.
+        """
+        from speech.speech_to_text import (  # noqa: PLC0415
+            classify_yes_no,
         )
-        response_q.put(reply == QMessageBox.StandardButton.Yes)
+
+        dlg = VoiceConfirmDialog(question, parent=self)
+
+        # Speak the question if voice is on so the user actually
+        # *hears* what they're confirming. We wait for TTS to finish
+        # before listening (the route-target check at the top of
+        # `_listen_loop` already does this), so spoken "Yes / No"
+        # prompts don't get echoed back into the classifier.
+        if self.voice_enabled:
+            self._speak_async(question)
+
+        def on_voice(text: str) -> None:
+            verdict = classify_yes_no(text)
+            # Bounce UI updates onto the Qt thread.
+            QTimer.singleShot(
+                0, lambda: dlg.show_voice_feedback(text, verdict)
+            )
+            if verdict is True:
+                QTimer.singleShot(0, dlg.accept)
+            elif verdict is False:
+                QTimer.singleShot(0, dlg.reject)
+
+        self._voice_capture_target = on_voice
+        try:
+            result = dlg.exec()
+        finally:
+            self._voice_capture_target = None
+
+        accepted = result == QDialog.DialogCode.Accepted
+        response_q.put(accepted)
 
     # ==================================================================
     # Status / animations
@@ -1250,20 +1679,54 @@ class Dashboard(QMainWindow):
     def _refresh_history_view(self) -> None:
         needle = (self.filter_edit.text() or "").strip().lower()
         self.history_list.clear()
-        entries = self.app.history.latest(200)
-        for entry in reversed(entries):
-            if needle and needle not in entry.user_text.lower() \
-                    and needle not in entry.intent_kind.lower():
+
+        # Group the (filtered) recent entries by day so the sidebar
+        # shows clear "Today", "Yesterday", "Apr 25" dividers — same
+        # structure the full HistoryDialog uses, just trimmed for the
+        # narrow column.
+        from datetime import date as _date  # noqa: PLC0415
+        today = _date.today()
+
+        groups = self.app.history.by_day(days=RETENTION_DAYS)
+        for day, entries in groups.items():
+            shown = [
+                e for e in entries
+                if not needle
+                or needle in e.user_text.lower()
+                or needle in e.intent_kind.lower()
+                or needle in e.response.lower()
+            ]
+            if not shown:
                 continue
-            item_text = (
-                f"{format_local(entry.timestamp)}\n"
-                f"  {entry.intent_kind}"
-            )
-            it = QListWidgetItem(item_text)
-            it.setForeground(QColor(Palette.FG if entry.success
-                                    else Palette.ERROR))
-            it.setData(Qt.ItemDataRole.UserRole, entry)
-            self.history_list.addItem(it)
+            delta = (today - day).days
+            if delta == 0:
+                day_label = "TODAY"
+            elif delta == 1:
+                day_label = "YESTERDAY"
+            elif delta < 7:
+                day_label = day.strftime("%A").upper()
+            else:
+                day_label = day.strftime("%b %d").upper()
+            divider_text = f"\u2500\u2500 {day_label} \u00B7 {len(shown)}"
+            divider = QListWidgetItem(divider_text)
+            divider.setFlags(Qt.ItemFlag.NoItemFlags)
+            divider.setForeground(QColor(Palette.ACCENT))
+            font = divider.font()
+            font.setBold(True)
+            font.setPointSize(max(font.pointSize() - 1, 8))
+            divider.setFont(font)
+            self.history_list.addItem(divider)
+
+            for entry in reversed(shown):
+                local = entry_local_dt(entry)
+                when = (local.strftime("%I:%M %p").lstrip("0")
+                        if local else "?")
+                item_text = f"  {when}\n    {entry.intent_kind}"
+                it = QListWidgetItem(item_text)
+                it.setForeground(QColor(Palette.FG if entry.success
+                                        else Palette.ERROR))
+                it.setData(Qt.ItemDataRole.UserRole, entry)
+                self.history_list.addItem(it)
 
     def _on_history_select(self) -> None:
         it = self.history_list.currentItem()

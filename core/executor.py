@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 from core.command_parser import CommandParser, Intent
-from core.history import History
+from core.history import History, HistoryEntry, RETENTION_DAYS, entry_local_dt
 from core.llm_client import LLMClient
 from core.memory import Memory
 from core.permissions import (
@@ -49,7 +49,38 @@ _TRUSTED_FAST_INTENTS = frozenset({
     "open_last_path", "list_last_path",
     "reset_permissions", "list_apps",
     "cancel_shutdown",
+    "clarify",
+    "recall_history",
 })
+
+
+# Voice-friendly counter-questions for vague commands. Both the rule
+# parser and the LLM emit ``Intent("clarify", {"for": "<intent>"})``
+# when the user's request is missing essential details (e.g. "create
+# file" with no name or destination). These prompts MUST stay short —
+# they are spoken aloud — and end with a clear question so the user
+# knows what to say next.
+_CLARIFY_PROMPTS: Dict[str, str] = {
+    "create_file":
+        "Sure — what should I name the file, and where should I create it?",
+    "create_folder":
+        "Of course — what name should the new folder have, and where do you want it?",
+    "delete":
+        "Which file or folder would you like me to delete? "
+        "Please tell me a name or full path.",
+    "rename":
+        "Which file should I rename, and what's the new name?",
+    "copy":
+        "Which file should I copy, and where should I copy it to?",
+    "move":
+        "Which file should I move, and where should it go?",
+    "search_file":
+        "What file name or keyword should I search for?",
+    "open_folder":
+        "Which folder should I open?",
+    "launch_app":
+        "Which application should I launch?",
+}
 
 
 @dataclass
@@ -196,6 +227,26 @@ class Executor:
         if kind == "exit":
             name = self.memory.user_name or "sir"
             return ExecutionResult(f"Goodbye, {name}.", True, kind, should_exit=True)
+
+        # Clarification — the user gave a vague command like "create file"
+        # or "delete file" with no target. We bounce a short follow-up
+        # question back rather than silently failing or guessing.
+        if kind == "clarify":
+            target = (args.get("for") or "command").strip()
+            prompt = _CLARIFY_PROMPTS.get(
+                target,
+                "I need a little more detail. Could you tell me which "
+                "file or folder, and where?",
+            )
+            return ExecutionResult(prompt, True, kind)
+
+        # Recall — the user is asking about something they've done in
+        # the last 30 days ("did I delete the resume", "what did I do
+        # today", "show my activity this week", ...). The history
+        # already enforces a 30-day TTL so we just need to translate
+        # the args into a query.
+        if kind == "recall_history":
+            return self._recall_history(args)
 
         if kind == "help":
             return ExecutionResult(self._help_text(), True, kind)
@@ -547,6 +598,50 @@ class Executor:
         )
 
     # ------------------------------------------------------------------
+    # History recall ("did I delete X yesterday?")
+    # ------------------------------------------------------------------
+    def _recall_history(self, args: Dict[str, Any]) -> ExecutionResult:
+        """Answer a question about past activity within the 30-day window."""
+        days = int(args.get("days") or RETENTION_DAYS)
+        days = max(1, min(RETENTION_DAYS, days))
+        keyword = (args.get("keyword") or "").strip() or None
+        intent_kind = (args.get("intent_kind") or "").strip() or None
+
+        matches = self.history.find(
+            keyword=keyword, intent_kind=intent_kind, days=days,
+        )
+        scope = _describe_window(days)
+
+        if not matches:
+            qualifiers: list[str] = []
+            if keyword:
+                qualifiers.append(f"matching '{keyword}'")
+            if intent_kind:
+                qualifiers.append(f"of type '{intent_kind}'")
+            tail = (" " + " ".join(qualifiers)) if qualifiers else ""
+            return ExecutionResult(
+                f"No, I don't see any commands{tail} from {scope}.",
+                True, "recall_history",
+            )
+
+        # `find` already returns newest-first.
+        headline = matches[0]
+        when_pretty = _humanise_when(headline)
+        what = (headline.user_text.strip()
+                or headline.response.strip()
+                or headline.intent_kind)
+        if len(what) > 80:
+            what = what[:77].rstrip() + "..."
+
+        msg = f"Yes — most recently you {what} ({when_pretty})."
+        if len(matches) > 1:
+            msg += (
+                f" I see {len(matches)} matching command"
+                f"{'s' if len(matches) != 1 else ''} from {scope}."
+            )
+        return ExecutionResult(msg, True, "recall_history")
+
+    # ------------------------------------------------------------------
     # Help
     # ------------------------------------------------------------------
     @staticmethod
@@ -561,6 +656,42 @@ class Executor:
             "Open a website, search the web, or take a screenshot. "
             "Tell me a joke, the time, the date, or do quick math. "
             "Read system info, change volume, or mute. "
+            "Ask 'did I delete that file yesterday' to recall recent activity. "
             "Wait ten minutes then restart the PC. "
             "Reset permissions. Or say goodbye to exit."
         )
+
+
+# ---------------------------------------------------------------------------
+# Free helpers used by the recall handler
+# ---------------------------------------------------------------------------
+def _describe_window(days: int) -> str:
+    """Map a day count back to a natural-language window description."""
+    if days <= 1:
+        return "today"
+    if days == 2:
+        return "today or yesterday"
+    if days == 7:
+        return "the last week"
+    if days == 30:
+        return "the last 30 days"
+    return f"the last {days} days"
+
+
+def _humanise_when(entry: HistoryEntry) -> str:
+    """Render an entry's timestamp as 'today at 3:14 PM' / '3 days ago'."""
+    from datetime import datetime  # noqa: PLC0415
+
+    local = entry_local_dt(entry)
+    if local is None:
+        return entry.timestamp or "an unknown time"
+    today = datetime.now().astimezone().date()
+    delta_days = (today - local.date()).days
+    time_str = local.strftime("%I:%M %p").lstrip("0")
+    if delta_days == 0:
+        return f"today at {time_str}"
+    if delta_days == 1:
+        return f"yesterday at {time_str}"
+    if delta_days < 7:
+        return f"{delta_days} days ago at {time_str}"
+    return local.strftime("on %b %d at ") + time_str

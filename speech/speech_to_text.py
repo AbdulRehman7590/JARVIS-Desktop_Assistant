@@ -84,6 +84,70 @@ def strip_wake_prefix(text: str) -> Tuple[str, bool]:
         return text[m.end():].strip(" .,!?"), True
     return text.strip(), contains_wake_phrase(text)
 
+
+# ---------------------------------------------------------------------------
+# Yes / No classifier — shared by every voice-confirmation surface
+# (voice-only mode in main.py *and* the GUI confirm dialog) so we always
+# react to the same vocabulary regardless of front-end.
+# ---------------------------------------------------------------------------
+_YES_TOKENS: Tuple[str, ...] = (
+    "yes", "yeah", "yep", "yup", "yo", "ya",
+    "ok", "okay", "k", "kay",
+    "sure", "alright", "all right",
+    "confirm", "confirmed", "affirmative",
+    "do it", "go ahead", "proceed", "continue",
+    "fine", "right", "correct",
+    "delete it", "remove it", "kill it",
+    "yes please", "please do",
+)
+_NO_TOKENS: Tuple[str, ...] = (
+    "no", "nope", "nah", "naw", "negative",
+    "cancel", "abort", "stop", "skip",
+    "don't", "do not", "dont",
+    "never mind", "nevermind", "forget it",
+    "back off", "leave it", "keep it",
+    "no thanks", "no thank you",
+)
+# Pre-compile a fast lookup that respects word boundaries — we want
+# "no thanks" to win even if "yes" appears later in the same phrase.
+_YES_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in _YES_TOKENS) + r")\b",
+    re.IGNORECASE,
+)
+_NO_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(t) for t in _NO_TOKENS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def classify_yes_no(text: Optional[str]) -> Optional[bool]:
+    """Map free-form speech to a yes/no/uncertain verdict.
+
+    Returns ``True`` if the user clearly affirmed, ``False`` if they
+    clearly declined, or ``None`` when it's ambiguous (or empty). The
+    classifier is intentionally permissive — voice transcripts are noisy
+    and the user might say "do it", "go ahead", "confirm", "nope", etc.
+
+    A leading "Jarvis" / "hey jarvis" is stripped first so phrases like
+    "Jarvis, yes" still register as a confirmation.
+    """
+    if not text:
+        return None
+    cleaned, _ = strip_wake_prefix(text)
+    cleaned = (cleaned or text).strip().strip(".!?,;:'\"").lower()
+    if not cleaned:
+        return None
+    no_match = _NO_RE.search(cleaned)
+    yes_match = _YES_RE.search(cleaned)
+    if no_match and yes_match:
+        # Earliest token wins — "no thanks, yes please" → no.
+        return no_match.start() > yes_match.start()
+    if yes_match:
+        return True
+    if no_match:
+        return False
+    return None
+
 # Audio-capture defaults used by the sounddevice backend.
 SAMPLE_RATE = 16_000
 SAMPLE_WIDTH = 2  # 16-bit PCM

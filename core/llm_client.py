@@ -64,7 +64,9 @@ Supported action intents and their args:
   list_dir             {"path": "<folder>"}
   open_last_path       {}                                  open the most recently created/touched folder
   list_last_path       {}                                  list the most recently created/touched folder
-  search_file          {"pattern": "<text>", "roots": ["<folder>"]?}   roots optional
+  search_file          {"pattern": "<text>", "roots": ["<folder-or-drive>"]?}
+                       Omit "roots" to search every drive in parallel. Pass a
+                       drive ("C:", "D drive") or folder to scope the search.
   create_folder        {"name": "<name>", "parent": "<folder>"}
   create_file          {"name": "<filename>", "parent": "<folder>", "contents": "<text>"}
   rename               {"src": "<path>", "new_name": "<new filename>"}
@@ -100,10 +102,29 @@ Supported action intents and their args:
   list_apps            {}
   help                 {}
   exit                 {}
+  recall_history       {"keyword": "<text>"?, "intent_kind": "<kind>"?, "days": <int 1-30>?}
+                       Use when the user asks about something they've done in the
+                       last 30 days ("did I delete that file yesterday?", "what did
+                       I do this week?", "have I created any folders today?"). The
+                       assistant remembers up to 30 days of commands; older ones
+                       are gone. `intent_kind` (one of: delete, create_file,
+                       create_folder, rename, move, copy, search_file, open_folder,
+                       launch_app, screenshot) narrows by action; `keyword` matches
+                       file/app names; `days` defaults to 30. NEVER use this to
+                       actually perform the action — only to look it up.
+  clarify              {"for": "<intent_kind>"}
+                       Emit this when the user's request is missing essential details
+                       (e.g. they say "create a file" with no name/folder, "delete file"
+                       with no target, "rename" with no source, "search" with no query).
+                       JARVIS will ask the user a tailored follow-up question instead of
+                       guessing. `for` must be the kind of action they were trying to do
+                       (one of: create_file, create_folder, delete, rename, copy, move,
+                       search_file, open_folder, launch_app).
 
 Rules:
   * Resolve named folders ("documents", "downloads", "desktop", "home") to those bare keywords.
-  * Never invent paths the user didn't mention. If unsure, ask in CHAT mode.
+  * Never invent paths, file names, or app names the user didn't mention. If even one
+    essential argument is missing, prefer `clarify` over guessing.
   * For pronouns like "open it", "go there", "show me that folder", emit `open_last_path`
     (or `list_last_path`). The system already remembers the last folder JARVIS touched.
   * If the request is destructive (delete / rename / overwrite / shutdown), do NOT confirm
@@ -136,6 +157,24 @@ Examples:
 
   user: "what's 12 times 7"
   -> {"mode":"action","intent":"calculate","args":{"expression":"12*7"},"reply":"That's eighty-four."}
+
+  user: "create a file"           # vague — no name, no folder
+  -> {"mode":"action","intent":"clarify","args":{"for":"create_file"},"reply":"Sure — what name and where?"}
+
+  user: "delete file"             # vague — no target
+  -> {"mode":"action","intent":"clarify","args":{"for":"delete"},"reply":"Which file should I delete?"}
+
+  user: "ek file banao"           # Urdu/Hindi: "make a file" — still vague
+  -> {"mode":"action","intent":"clarify","args":{"for":"create_file"},"reply":"Of course — what name, and which folder?"}
+
+  user: "did i delete that resume yesterday"
+  -> {"mode":"action","intent":"recall_history","args":{"keyword":"resume","intent_kind":"delete","days":2},"reply":"Let me check your history."}
+
+  user: "what did i do today"
+  -> {"mode":"action","intent":"recall_history","args":{"days":1},"reply":"Looking up today's activity."}
+
+  user: "have i opened chrome this week"
+  -> {"mode":"action","intent":"recall_history","args":{"keyword":"chrome","intent_kind":"launch_app","days":7},"reply":"Checking my logs."}
 """
 
 

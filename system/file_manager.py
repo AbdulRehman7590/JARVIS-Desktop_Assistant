@@ -17,13 +17,16 @@ system. It enforces:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import string
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional, Tuple
 
 from utils.logger import get_logger
 from utils.paths import user_home
@@ -64,6 +67,74 @@ ConfirmFn = Callable[[str], bool]
 
 class FileSafetyError(Exception):
     """Raised when an operation would touch a protected/illegal path."""
+
+
+# ---------------------------------------------------------------------------
+# Drive helpers (Windows-aware, but safe on POSIX)
+# ---------------------------------------------------------------------------
+def list_drives() -> List[str]:
+    """Return the available local drive roots.
+
+    On Windows that's something like ``["C:\\", "D:\\"]``. On POSIX systems
+    we fall back to ``["/"]`` so search-from-root behaviour still works.
+    """
+    if not sys.platform.startswith("win"):
+        root = Path("/")
+        return [str(root)] if root.exists() else []
+    return [
+        f"{letter}:\\"
+        for letter in string.ascii_uppercase
+        if Path(f"{letter}:\\").exists()
+    ]
+
+
+# Match things people actually say or type for a drive:
+#   "c", "c:", "c:/", "c:\\", "c drive", "drive c", "the c drive"
+_DRIVE_HINT_RE = re.compile(
+    r"""^\s*
+        (?:the\s+)?
+        (?:drive\s+)?            # "drive c"
+        ([A-Za-z])                # the letter
+        \s*
+        (?::|\s*drive)?           # "c:", "c drive"
+        [\\/]?                    # trailing slash
+        \s*$
+    """,
+    re.VERBOSE,
+)
+
+
+def _count_tree(root: Path, cap: int = 10_000) -> Tuple[int, int]:
+    """Return ``(files, dirs)`` inside ``root`` (capped to keep delete
+    confirmations responsive even when pointed at huge trees).
+    """
+    files = 0
+    dirs = 0
+    try:
+        for _current, dirnames, filenames in os.walk(root, followlinks=False):
+            files += len(filenames)
+            dirs += len(dirnames)
+            if files + dirs >= cap:
+                break
+    except OSError:
+        pass
+    return files, dirs
+
+
+def resolve_drive_hint(hint: str) -> Optional[Path]:
+    """If ``hint`` names a drive (``"C"``, ``"D:"``, ``"E drive"``...) return its root.
+
+    Returns ``None`` if the hint doesn't look like a drive reference or the
+    drive isn't mounted. Always returns ``None`` on non-Windows.
+    """
+    if not hint or not sys.platform.startswith("win"):
+        return None
+    m = _DRIVE_HINT_RE.match(hint)
+    if not m:
+        return None
+    letter = m.group(1).upper()
+    root = Path(f"{letter}:\\")
+    return root if root.exists() else None
 
 
 # ---------------------------------------------------------------------------
@@ -200,50 +271,141 @@ class FileManager:
         roots: Optional[Iterable[str]] = None,
         max_results: int = 25,
     ) -> FileOpResult:
-        """Recursively search for files whose name contains ``pattern``."""
+        """Recursively search for files whose name contains ``pattern``.
+
+        Behaviour:
+
+        * If no ``roots`` are given, the search starts from the *root of every
+          mounted drive* (e.g. ``C:\\``, ``D:\\``, ...) and one worker thread is
+          spun up per drive so they crawl in parallel.
+        * If ``roots`` are given, each entry is resolved. A bare drive
+          reference (``"C"``, ``"C:"``, ``"D drive"``, ...) is mapped to that
+          drive's root, and only those drives/folders are searched — again,
+          one thread per root.
+        * Search is short-circuited across all workers as soon as
+          ``max_results`` matches have been collected.
+        """
         pattern = (pattern or "").strip().lower()
         if not pattern:
             return FileOpResult(False, "Please tell me what to search for.")
 
-        search_roots: List[Path] = []
-        if roots:
-            for r in roots:
-                try:
-                    search_roots.append(normalise_path(r))
-                except FileSafetyError:
-                    continue
+        search_roots = self._resolve_search_roots(roots)
         if not search_roots:
-            search_roots = [user_home()]
+            return FileOpResult(
+                False,
+                "I couldn't find any drive or folder to search in.",
+            )
 
         matches: List[Path] = []
-        for root in search_roots:
-            if not root.exists() or not root.is_dir():
-                continue
-            for current, dirs, files in os.walk(root, followlinks=False):
-                # Skip protected roots so we don't waste time crawling Windows/.
-                cur_path = Path(current)
-                if any(_is_inside(cur_path, prot) or cur_path == prot
-                       for prot in PROTECTED_WRITE_ROOTS):
-                    dirs.clear()
-                    continue
-                for name in files:
-                    if pattern in name.lower():
-                        matches.append(cur_path / name)
-                        if len(matches) >= max_results:
-                            break
-                if len(matches) >= max_results:
+        matches_lock = threading.Lock()
+        stop_event = threading.Event()
+
+        def crawl(root: Path) -> None:
+            try:
+                for current, dirs, files in os.walk(root, followlinks=False):
+                    if stop_event.is_set():
+                        return
+                    cur_path = Path(current)
+                    # Skip protected system roots so we don't waste time
+                    # crawling Windows/, Program Files/, etc.
+                    if any(
+                        _is_inside(cur_path, prot) or cur_path == prot
+                        for prot in PROTECTED_WRITE_ROOTS
+                    ):
+                        dirs.clear()
+                        continue
+                    # Hide hidden/system dirs (.git, $Recycle.Bin, ...) — these
+                    # are huge and almost never what the user wants.
+                    dirs[:] = [d for d in dirs if not d.startswith((".", "$"))]
+
+                    found_here: List[Path] = []
+                    for name in files:
+                        if pattern in name.lower():
+                            found_here.append(cur_path / name)
+
+                    if found_here:
+                        with matches_lock:
+                            for p in found_here:
+                                if len(matches) >= max_results:
+                                    stop_event.set()
+                                    break
+                                matches.append(p)
+                            if len(matches) >= max_results:
+                                stop_event.set()
+                                return
+            except (PermissionError, OSError) as exc:
+                _log.debug("search skipped %s: %s", root, exc)
+
+        # One worker per root — exactly what the user asked for.
+        worker_count = max(1, len(search_roots))
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="jarvis-search",
+        ) as pool:
+            futures = [pool.submit(crawl, r) for r in search_roots]
+            for _ in as_completed(futures):
+                if stop_event.is_set():
+                    # Other workers will notice the event on their next loop
+                    # iteration and bail out promptly.
                     break
-            if len(matches) >= max_results:
-                break
 
         if not matches:
-            return FileOpResult(False, f"No files matched '{pattern}'.")
+            scope = (
+                ", ".join(str(r) for r in search_roots)
+                if len(search_roots) <= 3
+                else f"{len(search_roots)} drives"
+            )
+            return FileOpResult(
+                False, f"No files matched '{pattern}' in {scope}."
+            )
         names = ", ".join(p.name for p in matches[:5])
         msg = (
             f"Found {len(matches)} match{'es' if len(matches) != 1 else ''}. "
             f"Top results: {names}."
         )
         return FileOpResult(True, msg, payload=matches)
+
+    @staticmethod
+    def _resolve_search_roots(
+        roots: Optional[Iterable[str]],
+    ) -> List[Path]:
+        """Translate user-supplied root hints into real, existing directories.
+
+        * ``None`` / empty ⇒ every mounted drive root.
+        * Strings like ``"C"``, ``"D:"``, ``"E drive"`` ⇒ that drive's root.
+        * Anything else is run through :func:`normalise_path`.
+        Duplicates and non-existent entries are filtered out.
+        """
+        resolved: List[Path] = []
+        seen: set[Path] = set()
+
+        def add(p: Path) -> None:
+            if not p.exists() or not p.is_dir():
+                return
+            key = Path(str(p).rstrip("\\/").lower() or str(p))
+            if key in seen:
+                return
+            seen.add(key)
+            resolved.append(p)
+
+        if not roots:
+            for drive in list_drives():
+                add(Path(drive))
+            return resolved
+
+        for raw in roots:
+            if not raw:
+                continue
+            drive_root = resolve_drive_hint(str(raw))
+            if drive_root is not None:
+                add(drive_root)
+                continue
+            try:
+                add(normalise_path(str(raw)))
+            except FileSafetyError:
+                continue
+
+        return resolved
 
     # ---- write operations (guarded) -----------------------------------
     def create_folder(self, parent_dir: str, folder_name: str) -> FileOpResult:
@@ -350,9 +512,13 @@ class FileManager:
         assert_writable(target)
         if not target.exists():
             return FileOpResult(False, f"Nothing to delete at {target}.")
-        if not self._confirm(
-            f"Permanently delete {target}? This cannot be undone."
-        ):
+
+        # Build a clear, voice-friendly confirmation. For folders we
+        # surface the contents count so a "bulk" delete is never silent
+        # — the user explicitly hears how many items are about to be
+        # erased before they say yes.
+        question = self._build_delete_question(target)
+        if not self._confirm(question):
             return FileOpResult(False, "Delete cancelled.")
         try:
             if target.is_dir():
@@ -362,6 +528,106 @@ class FileManager:
             return FileOpResult(True, f"{target.name} deleted.")
         except OSError as exc:
             return FileOpResult(False, f"Could not delete: {exc}")
+
+    def bulk_delete(self, raw_paths: Iterable[str]) -> FileOpResult:
+        """Delete several files / folders after a single grouped confirm.
+
+        The user gets ONE confirmation question listing every target
+        and the total number of inner items, so they can review the
+        whole batch before anything is removed.
+        """
+        targets: List[Path] = []
+        problems: List[str] = []
+        for raw in raw_paths or []:
+            try:
+                p = normalise_path(str(raw))
+                assert_writable(p)
+            except FileSafetyError as exc:
+                problems.append(f"{raw}: {exc}")
+                continue
+            if not p.exists():
+                problems.append(f"{raw}: not found")
+                continue
+            targets.append(p)
+
+        if not targets:
+            base = "Nothing to delete."
+            if problems:
+                base += " (" + "; ".join(problems[:3]) + ")"
+            return FileOpResult(False, base)
+
+        total_files = 0
+        total_dirs = 0
+        for t in targets:
+            if t.is_dir():
+                f, d = _count_tree(t)
+                total_files += f
+                total_dirs += d + 1  # the dir itself counts too
+            else:
+                total_files += 1
+
+        sample = ", ".join(t.name for t in targets[:3])
+        more = f" and {len(targets) - 3} more" if len(targets) > 3 else ""
+        question = (
+            f"BULK DELETE: permanently remove {len(targets)} item"
+            f"{'s' if len(targets) != 1 else ''} "
+            f"({sample}{more}) — totalling about "
+            f"{total_files} file{'s' if total_files != 1 else ''}"
+            + (f" and {total_dirs} folder{'s' if total_dirs != 1 else ''}"
+               if total_dirs else "")
+            + "? This cannot be undone."
+        )
+        if not self._confirm(question):
+            return FileOpResult(False, "Bulk delete cancelled.")
+
+        deleted: List[str] = []
+        for t in targets:
+            try:
+                if t.is_dir():
+                    shutil.rmtree(t)
+                else:
+                    t.unlink()
+                deleted.append(t.name)
+            except OSError as exc:
+                problems.append(f"{t.name}: {exc}")
+
+        msg_parts = [f"Deleted {len(deleted)} item"
+                     f"{'s' if len(deleted) != 1 else ''}."]
+        if problems:
+            msg_parts.append(
+                f"Skipped {len(problems)} ({'; '.join(problems[:3])})."
+            )
+        return FileOpResult(bool(deleted), " ".join(msg_parts),
+                            payload=deleted)
+
+    @staticmethod
+    def _build_delete_question(target: Path) -> str:
+        """Compose a confirmation prompt that always exposes bulk scope."""
+        if target.is_dir():
+            file_count, dir_count = _count_tree(target)
+            total = file_count + dir_count
+            if total == 0:
+                return (
+                    f"Permanently delete the empty folder '{target.name}'? "
+                    "This cannot be undone."
+                )
+            scope = (
+                f"{file_count} file{'s' if file_count != 1 else ''}"
+            )
+            if dir_count:
+                scope += (
+                    f" and {dir_count} subfolder"
+                    f"{'s' if dir_count != 1 else ''}"
+                )
+            tag = " (BULK)" if total >= 5 else ""
+            return (
+                f"Permanently delete the folder '{target.name}'{tag}? "
+                f"It contains {scope}. This cannot be undone."
+            )
+        return (
+            f"Permanently delete the file '{target.name}'? "
+            "This cannot be undone."
+        )
 
     def open_cmd(self, raw_dir: str) -> FileOpResult:
         """Spawn a CMD window in ``raw_dir`` (no command injection — pure argv)."""
@@ -380,9 +646,3 @@ class FileManager:
             return FileOpResult(False, f"Could not open CMD: {exc}")
 
 
-# Convenience helper: list the bare drive letters available on Windows.
-def list_drives() -> List[str]:
-    if not sys.platform.startswith("win"):
-        return []
-    return [f"{letter}:\\" for letter in string.ascii_uppercase
-            if Path(f"{letter}:\\").exists()]
